@@ -1,0 +1,20 @@
+# Environment variables containing sensitive credentials (API keys)
+.env
+
+# Python virtual environment folder
+.venv/
+env/
+venv/
+ENV/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local SQLite databases generated during runtime
+*.db
+munder_difflin.db
+
+# Output files from test runs
+test_results.csv
