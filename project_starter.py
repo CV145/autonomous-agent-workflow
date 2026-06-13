@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Union
 from sqlalchemy import create_engine, Engine
 from openai import OpenAI
+from smolagents import tool, OpenAIServerModel, ToolCallingAgent, ManagedAgent, CodeAgent
 
 load_dotenv()
 
@@ -603,26 +604,343 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 # Set up and load env parameters and instantiate the model.
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(
-    api_key=openai_api_key,
-    base_url="https://openai.vocareum.com/v1"
+model = OpenAIServerModel(
+    model_id="gpt-4o-mini",
+    api_base="https://openai.vocareum.com/v1",
+    api_key=openai_api_key
 )
 
 
-# Set up tools for your agents to use, these should be methods that combine the database functions above
-# and apply criteria to them to ensure that the flow of the system is correct.
-
 
 # Tools for inventory agent
+@tool
+def inventory_check_tool(paper_type: str, quantity: int, as_of_date: str) -> dict:
+    """Check inventory availability for a paper type and determine whether the order can be fulfilled immediately or if a reorder is needed."""
+    stock_df = get_stock_level(paper_type, as_of_date)
+    current_stock = int(stock_df["current_stock"].iloc[0]) if not stock_df.empty else 0
+
+    inventory_df = pd.read_sql(
+        "SELECT * FROM inventory WHERE item_name = :item_name",
+        db_engine,
+        params={"item_name": paper_type},
+    )
+
+    if inventory_df.empty:
+        return {
+            "item_name": paper_type,
+            "requested_quantity": quantity,
+            "exists_in_inventory_catalog": False,
+            "current_stock": 0,
+            "can_fulfill_now": False,
+            "needs_reorder": True,
+            "message": f"{paper_type} is not currently stocked in the inventory catalog.",
+        }
+
+    min_stock_level = int(inventory_df["min_stock_level"].iloc[0])
+    unit_price = float(inventory_df["unit_price"].iloc[0])
+
+    remaining_after_order = current_stock - quantity
+    can_fulfill_now = current_stock >= quantity
+    needs_reorder = remaining_after_order < min_stock_level
+
+    return {
+        "item_name": paper_type,
+        "requested_quantity": quantity,
+        "exists_in_inventory_catalog": True,
+        "current_stock": current_stock,
+        "min_stock_level": min_stock_level,
+        "unit_price": unit_price,
+        "can_fulfill_now": can_fulfill_now,
+        "remaining_after_order": remaining_after_order,
+        "needs_reorder": needs_reorder,
+        "message": (
+            "Enough stock available for immediate fulfillment."
+            if can_fulfill_now
+            else "Not enough stock available for immediate fulfillment."
+        ),
+    }
 
 
 # Tools for quoting agent
+@tool
+def quote_generation_tool(customer_id: str, paper_type: str, quantity: int, as_of_date: str) -> dict:
+    """Generate a customer quote for a paper order, including bulk discounts and recent quote history."""
+    inventory_result = inventory_check_tool(paper_type, quantity, as_of_date)
+
+    if not inventory_result["exists_in_inventory_catalog"]:
+        return {
+            "customer_id": customer_id,
+            "item_name": paper_type,
+            "requested_quantity": quantity,
+            "quote_available": False,
+            "message": f"Cannot generate quote because {paper_type} is not in the inventory catalog.",
+        }
+
+    unit_price = inventory_result["unit_price"]
+    base_total = unit_price * quantity
+
+    discount_rate = 0.0
+    if quantity >= 1000:
+        discount_rate = 0.15
+    elif quantity >= 500:
+        discount_rate = 0.10
+    elif quantity >= 100:
+        discount_rate = 0.05
+
+    discount_amount = base_total * discount_rate
+    final_total = base_total - discount_amount
+
+    history = search_quote_history([paper_type], limit=3)
+
+    return {
+        "customer_id": customer_id,
+        "item_name": paper_type,
+        "requested_quantity": quantity,
+        "unit_price": unit_price,
+        "base_total": round(base_total, 2),
+        "discount_rate": discount_rate,
+        "discount_amount": round(discount_amount, 2),
+        "final_total": round(final_total, 2),
+        "can_fulfill_now": inventory_result["can_fulfill_now"],
+        "needs_reorder": inventory_result["needs_reorder"],
+        "quote_history": history,
+        "quote_available": True,
+        "message": f"Quote generated for {quantity} units of {paper_type}.",
+    }
 
 
 # Tools for ordering agent
+@tool
+def supplier_timeline_tool(paper_type: str, quantity_needed: int, as_of_date: str) -> dict:
+    """Estimate when a supplier can deliver additional stock for a paper type."""
+    estimated_delivery_date = get_supplier_delivery_date(as_of_date, quantity_needed)
+
+    return {
+        "item_name": paper_type,
+        "quantity_needed": quantity_needed,
+        "estimated_delivery_date": estimated_delivery_date,
+        "message": f"Supplier can deliver {quantity_needed} units of {paper_type} by {estimated_delivery_date}.",
+    }
+
+
+@tool
+def fulfill_order_tool(customer_id: str, paper_type: str, quantity: int, as_of_date: str) -> dict:
+    """Fulfill a customer order if stock is available, execute sales transaction, and automatically place restocking orders with the supplier when inventory is low or insufficient."""
+    # 1. Fetch current stock and catalog details
+    inventory_result = inventory_check_tool(paper_type, quantity, as_of_date)
+
+    if not inventory_result["exists_in_inventory_catalog"]:
+        return {
+            "customer_id": customer_id,
+            "item_name": paper_type,
+            "requested_quantity": quantity,
+            "fulfilled": False,
+            "message": f"Order cannot be fulfilled because {paper_type} is not in the inventory catalog.",
+        }
+
+    # Retrieve unit price and safety level
+    unit_price = inventory_result["unit_price"]
+    min_stock_level = inventory_result["min_stock_level"]
+
+    # ==========================================
+    # SCENARIO A: Insufficient Stock (Failed Sale -> Emergency Restock)
+    # ==========================================
+    if not inventory_result["can_fulfill_now"]:
+        shortage = quantity - inventory_result["current_stock"]
+        # Determine restocking quantity (shortage plus safety stock buffer)
+        restock_quantity = shortage + (min_stock_level * 2)
+        restock_cost = restock_quantity * unit_price
+        
+        # Check cash balance before purchasing
+        cash = get_cash_balance(as_of_date)
+        restock_info = {"restock_executed": False}
+
+        if cash >= restock_cost:
+            # Execute supplier order
+            restock_tx = create_transaction(
+                item_name=paper_type,
+                transaction_type="stock_orders",
+                quantity=restock_quantity,
+                price=restock_cost,
+                date=as_of_date,
+            )
+            supplier_info = supplier_timeline_tool(paper_type, restock_quantity, as_of_date)
+            restock_info = {
+                "restock_executed": True,
+                "restock_quantity": restock_quantity,
+                "restock_cost": round(restock_cost, 2),
+                "restock_transaction_id": restock_tx,
+                "supplier_timeline": supplier_info,
+            }
+        else:
+            restock_info["reason"] = f"Insufficient cash to restock. Need: ${restock_cost:.2f}, Have: ${cash:.2f}"
+
+        return {
+            "customer_id": customer_id,
+            "item_name": paper_type,
+            "requested_quantity": quantity,
+            "fulfilled": False,
+            "shortage": shortage,
+            "restock_info": restock_info,
+            "message": "Insufficient stock to fulfill order immediately. A supplier order has been placed/attempted.",
+        }
+
+    # ==========================================
+    # SCENARIO B: Successful Sale (Fulfill -> Proactive Restock if needed)
+    # ==========================================
+    quote_result = quote_generation_tool(customer_id, paper_type, quantity, as_of_date)
+    
+    # Record the sale transaction
+    sale_tx = create_transaction(
+        item_name=paper_type,
+        transaction_type="sales",
+        quantity=quantity,
+        price=quote_result["final_total"],
+        date=as_of_date,
+    )
+
+    # If the sale causes inventory to drop below the safety limit, trigger a proactive restock
+    reorder_info = None
+    if inventory_result["needs_reorder"]:
+        reorder_quantity = max(quantity, min_stock_level * 2)
+        reorder_cost = reorder_quantity * unit_price
+        
+        # Verify company cash
+        cash = get_cash_balance(as_of_date)
+        if cash >= reorder_cost:
+            # Execute supplier order
+            restock_tx = create_transaction(
+                item_name=paper_type,
+                transaction_type="stock_orders",
+                quantity=reorder_quantity,
+                price=reorder_cost,
+                date=as_of_date,
+            )
+            supplier_info = supplier_timeline_tool(paper_type, reorder_quantity, as_of_date)
+            
+            reorder_info = {
+                "restock_executed": True,
+                "reorder_quantity": reorder_quantity,
+                "reorder_cost": round(reorder_cost, 2),
+                "restock_transaction_id": restock_tx,
+                "supplier_timeline": supplier_info,
+            }
+        else:
+            reorder_info = {
+                "restock_executed": False,
+                "reason": f"Insufficient cash to restock safety levels. Need: ${reorder_cost:.2f}, Have: ${cash:.2f}"
+            }
+
+    return {
+        "customer_id": customer_id,
+        "item_name": paper_type,
+        "requested_quantity": quantity,
+        "fulfilled": True,
+        "transaction_id": sale_tx,
+        "sale_price": quote_result["final_total"],
+        "reorder_info": reorder_info,
+        "message": f"Order fulfilled successfully for {quantity} units of {paper_type}.",
+    }
 
 
 # Set up your agents and create an orchestration agent that will manage them.
+class InventoryAgent(ToolCallingAgent):
+    def __init__(self, model):
+        """
+        Subclass of ToolCallingAgent representing the Inventory Agent. It encapsulates the inventory check tool and specializes in stock queries.
+        """
+        # Call the parent constructor with the inventory tools and system prompt
+        super().__init__(
+            tools=[inventory_check_tool],
+            model=model,
+            system_prompt=(
+                "You are Munder Difflin's Inventory Agent. "
+                "Your sole task is to check stock levels for a given paper type, quantity, and date. "
+                "Always use the `inventory_check_tool` tool to run queries. "
+                "Respond with a structured summary containing: "
+                "1. The current stock level. "
+                "2. Whether there is enough stock for immediate fulfillment. "
+                "3. Whether a reorder/restock is triggered (i.e. if the stock falls below the safety level)."
+            )
+        )
+
+class QuoteAgent(ToolCallingAgent):
+    def __init__(self, model):
+        """
+        It encapsulates the quote_generation_tool and search_quote_history and specializes in queries related to quotes
+        """
+        super().__init__(
+            tools=[quote_generation_tool],
+            model=model,
+            system_prompt=(
+                                "You are Munder Difflin's Quote Specialist. "
+                "Your role is to evaluate customer quote requests, find pricing history, apply bulk discounts, and return a detailed quote response.\n\n"
+                
+                "INSTRUCTIONS:\n"
+                "1. Always use the `quote_generation_tool` to calculate base prices, apply tiered discounts, and query historical quotes.\n"
+                "2. Ensure you propagate the exact `as_of_date` received in the user prompt to the tools.\n"
+                "3. Always explain your pricing calculation clearly, outlining:\n"
+                "   - The base unit price and standard total.\n"
+                "   - The percentage discount applied (if any) and the total money saved.\n"
+                "   - The final quoted total.\n"
+                "4. If a product is not stocked in our catalog, clearly state that a quote cannot be generated."
+            )
+        )
+
+class FulfillmentAgent(ToolCallingAgent):
+    def __init__(self, model):
+        """
+        Subclass of ToolCallingAgent representing the Fulfillment Agent.
+        It uses the fulfill_order_tool and supplier_timeline_tool to process transactions and timelines.
+        """
+        super().__init__(
+            tools=[fulfill_order_tool, supplier_timeline_tool],
+            model=model,
+            system_prompt=(
+                "You are Munder Difflin's Fulfillment Agent. "
+                "Your role is to process customer orders and calculate supplier logistics.\n\n"
+                
+                "INSTRUCTIONS:\n"
+                "1. When an order needs to be completed, call `fulfill_order_tool` with the customer_id, paper_type, quantity, and request date.\n"
+                "2. If the order is successfully fulfilled, check if the tool output includes a `reorder_info` suggestion (which happens when stock drops below the safety minimum).\n"
+                "3. If the order cannot be fulfilled due to a stock shortage, review the tool's returned shortage details and supplier timeline.\n"
+                "4. Always ensure you propagate the exact transaction date to the tools.\n"
+                "5. Report back a clear summary of whether the order was fulfilled, any shortage quantity, and the estimated supplier delivery date."
+            )
+        )
+
+
+class OrchestratorAgent(CodeAgent):
+    def __init__(self, model, managed_agents):
+        """
+        Subclass of CodeAgent representing the Chief Orchestrator.
+        It manages control flow and delegates tasks to sub-agents.
+        """
+        super().__init__(
+            tools=[],
+            model=model,
+            managed_agents=managed_agents,
+            system_prompt=(
+                "You are Munder Difflin's Chief Orchestrator Agent. "
+                "Your goal is to handle customer requests by delegating tasks to your specialized team:\n"
+                "- Use `inventory_agent` to check stock availability.\n"
+                "- Use `quote_agent` to generate quotes with bulk discounts.\n"
+                "- Use `fulfillment_agent` to log sales and process supplier restocking orders.\n\n"
+                
+                "CRITICAL LOGIC FLOW:\n"
+                "1. When a customer request is received, identify the paper type, quantity, and requested date.\n"
+                "2. First, ask `inventory_agent` to check stock as of the requested date.\n"
+                "3. If stock is available:\n"
+                "   a. Ask `quote_agent` to calculate the quote for the request.\n"
+                "   b. Ask `fulfillment_agent` to record the sale transaction. If the transaction triggers a restock suggestion (needs_reorder), tell `fulfillment_agent` to place the restock order immediately.\n"
+                "4. If stock is insufficient:\n"
+                "   a. Do not log a customer sale. Instead, ask `fulfillment_agent` to place an emergency restock order to the supplier.\n"
+                "   b. Inform the customer of the stockout, the shortage quantity, and the estimated supplier delivery date.\n"
+                "5. Always pass the exact request date to all agents so queries and logs are chronologically accurate.\n"
+                "6. Provide a concise final response summarizing the outcome (e.g. sale success, price, restock orders, and timelines)."
+            )
+        )
+
 
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
@@ -651,10 +969,36 @@ def run_test_scenarios():
     ############
     ############
     ############
-    # INITIALIZE YOUR MULTI AGENT SYSTEM HERE
+    # INITIALIZE MULTI AGENT SYSTEM HERE
     ############
     ############
     ############
+
+    inventory_sub = InventoryAgent(model=model)
+    inventory_managed = ManagedAgent(
+        agent=inventory_sub,
+        name="inventory_agent",
+        description="Checks item stock level, safety minimums, and flags if restocks are needed."
+    )
+
+    quote_sub = QuoteAgent(model=model)
+    quote_managed = ManagedAgent(
+        agent=quote_sub,
+        name="quote_agent",
+        description="Generates customer quotes and applies appropriate tiered bulk discounts."
+    )
+
+    fulfillment_sub = FulfillmentAgent(model=model)
+    fulfillment_managed = ManagedAgent(
+        agent=fulfillment_sub,
+        name="fulfillment_agent",
+        description="Logs sales transactions to customers and handles restocking orders to suppliers."
+    )
+
+    orchestrator_agent = OrchestratorAgent(
+        model=model,
+        managed_agents=[inventory_managed, quote_managed, fulfillment_managed]
+    )
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
@@ -672,12 +1016,12 @@ def run_test_scenarios():
         ############
         ############
         ############
-        # USE YOUR MULTI AGENT SYSTEM TO HANDLE THE REQUEST
+        # USE THE MULTI AGENT SYSTEM TO HANDLE THE REQUEST
         ############
         ############
         ############
 
-        # response = call_your_multi_agent_system(request_with_date)
+        response = orchestrator_agent.run(request_with_date)
 
         # Update state
         report = generate_financial_report(request_date)
