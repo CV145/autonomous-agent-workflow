@@ -988,28 +988,30 @@ class OrchestratorAgent(ToolCallingAgent):
             description="Coordinates specialized agents for inventory, quotes, and fulfillment.",
         )
         
-    def process_request(self, customer_request: str) -> str:
-        """
-        Process a customer request through the coordinated agent workflow.
-        """
-        prompt = f"""
-        You are the Chief Orchestrator. 
-        A customer has sent a request: "{customer_request}".
-        
-        Your objective is to coordinate the workflow to handle this request using your available tools.
-        
-        CRITICAL workflow rules:
-        1. Extract the paper product name, quantity, customer ID, and request date from the request details.
-        2. Call `check_stock_level` first to check stock availability as of the requested date.
-        3. If stock is sufficient:
-           - Call `create_customer_quote` to get the pricing.
-           - Call `execute_fulfillment` to log the sales transaction.
-        4. If stock is insufficient:
-           - Call `execute_fulfillment` to execute an emergency supplier restocking order.
-           - Summarize the stockout, shortage, and delivery date for the customer.
-        5. Provide a final, comprehensive response to the customer summarizing all transaction details.
-        """
-        return self.run(prompt)
+        def process_request(self, customer_request: str) -> str:
+            """
+            Process a customer request through the coordinated agent workflow.
+            """
+            prompt = f"""
+            You are the Chief Orchestrator. 
+            A customer has sent a request: "{customer_request}".
+            
+            Your objective is to coordinate the workflow to handle this request using your available tools.
+            
+            CRITICAL workflow rules:
+            1. Extract the paper product name, quantity, customer ID, and request date from the request details.
+            2. Call `check_stock_level` first to check stock availability as of the requested date.
+            3. If stock is sufficient:
+            - Call `create_customer_quote` to get the pricing.
+            - Call `execute_fulfillment` to log the sales transaction.
+            - Once `execute_fulfillment` is run, immediately return your final answer summarizing the successful sale. Do not loop.
+            4. If stock is insufficient:
+            - Call `execute_fulfillment` EXACTLY ONCE to execute the emergency supplier restocking order.
+            - Immediately after calling `execute_fulfillment`, use the `final_answer` tool to inform the customer of the stockout, shortage, and delivery date.
+            - DO NOT check stock again or call any other tool after placing the restock order, as the new stock will only arrive in the future.
+            5. Provide a final, comprehensive response to the customer summarizing all transaction details.
+            """
+            return self.run(prompt)
 
 
 
@@ -1050,10 +1052,7 @@ def run_test_scenarios():
 
     fulfillment_sub = FulfillmentAgent(model=model)
 
-    orchestrator_agent = OrchestratorAgent(
-        model=model,
-        managed_agents=[inventory_sub, quote_sub, fulfillment_sub]
-    )
+    orchestrator_agent = OrchestratorAgent(model=model)
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
