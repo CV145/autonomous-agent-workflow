@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Union
 from sqlalchemy import create_engine, Engine
 from openai import OpenAI
-from smolagents import tool, OpenAIServerModel, ToolCallingAgent, ManagedAgent, CodeAgent
+from smolagents import tool, OpenAIServerModel, ToolCallingAgent, CodeAgent
 
 load_dotenv()
 
@@ -615,7 +615,12 @@ model = OpenAIServerModel(
 # Tools for inventory agent
 @tool
 def inventory_check_tool(paper_type: str, quantity: int, as_of_date: str) -> dict:
-    """Check inventory availability for a paper type and determine whether the order can be fulfilled immediately or if a reorder is needed."""
+    """Check inventory availability for a paper type and determine whether the order can be fulfilled immediately or if a reorder is needed.
+    Args:
+        paper_type: The exact name of the paper product to check.
+        quantity: The number of units requested by the customer.
+        as_of_date: The date of the request in YYYY-MM-DD format.
+    """
     stock_df = get_stock_level(paper_type, as_of_date)
     current_stock = int(stock_df["current_stock"].iloc[0]) if not stock_df.empty else 0
 
@@ -664,7 +669,13 @@ def inventory_check_tool(paper_type: str, quantity: int, as_of_date: str) -> dic
 # Tools for quoting agent
 @tool
 def quote_generation_tool(customer_id: str, paper_type: str, quantity: int, as_of_date: str) -> dict:
-    """Generate a customer quote for a paper order, including bulk discounts and recent quote history."""
+    """Generate a customer quote for a paper order, including bulk discounts and recent quote history.
+    Args:
+        customer_id: The identifier for the customer requesting the quote.
+        paper_type: The exact name of the paper product.
+        quantity: The number of units of paper requested.
+        as_of_date: The date of the request in YYYY-MM-DD format.
+    """
     inventory_result = inventory_check_tool(paper_type, quantity, as_of_date)
 
     if not inventory_result["exists_in_inventory_catalog"]:
@@ -712,7 +723,12 @@ def quote_generation_tool(customer_id: str, paper_type: str, quantity: int, as_o
 # Tools for ordering agent
 @tool
 def supplier_timeline_tool(paper_type: str, quantity_needed: int, as_of_date: str) -> dict:
-    """Estimate when a supplier can deliver additional stock for a paper type."""
+    """Estimate when a supplier can deliver additional stock for a paper type.
+    Args:
+        paper_type: The name of the paper product to restock.
+        quantity_needed: The amount of stock being ordered from the supplier.
+        as_of_date: The date the restock order is placed in YYYY-MM-DD format.
+    """
     estimated_delivery_date = get_supplier_delivery_date(as_of_date, quantity_needed)
 
     return {
@@ -725,7 +741,13 @@ def supplier_timeline_tool(paper_type: str, quantity_needed: int, as_of_date: st
 
 @tool
 def fulfill_order_tool(customer_id: str, paper_type: str, quantity: int, as_of_date: str) -> dict:
-    """Fulfill a customer order if stock is available, execute sales transaction, and automatically place restocking orders with the supplier when inventory is low or insufficient."""
+    """Fulfill a customer order if stock is available, execute sales transaction, and automatically place restocking orders with the supplier when inventory is low or insufficient.
+        Args:
+        customer_id: The identifier for the customer placing the order.
+        paper_type: The exact name of the paper product to be purchased.
+        quantity: The number of units the customer wants to buy.
+        as_of_date: The date the order is executed in YYYY-MM-DD format.
+        """
     # 1. Fetch current stock and catalog details
     inventory_result = inventory_check_tool(paper_type, quantity, as_of_date)
 
@@ -846,100 +868,148 @@ def fulfill_order_tool(customer_id: str, paper_type: str, quantity: int, as_of_d
 # Set up your agents and create an orchestration agent that will manage them.
 class InventoryAgent(ToolCallingAgent):
     def __init__(self, model):
-        """
-        Subclass of ToolCallingAgent representing the Inventory Agent. It encapsulates the inventory check tool and specializes in stock queries.
-        """
-        # Call the parent constructor with the inventory tools and system prompt
         super().__init__(
             tools=[inventory_check_tool],
             model=model,
-            system_prompt=(
-                "You are Munder Difflin's Inventory Agent. "
-                "Your sole task is to check stock levels for a given paper type, quantity, and date. "
-                "Always use the `inventory_check_tool` tool to run queries. "
-                "Respond with a structured summary containing: "
-                "1. The current stock level. "
-                "2. Whether there is enough stock for immediate fulfillment. "
-                "3. Whether a reorder/restock is triggered (i.e. if the stock falls below the safety level)."
-            )
+            name="inventory_agent",
+            description="Checks item stock level, safety minimums, and flags if restocks are needed."
         )
+
+    def check_stock(self, paper_type: str, quantity: int, request_date: str) -> str:
+        prompt = f"""
+        You are the Inventory Agent. 
+        Please check if we can fulfill an order for {quantity} units of '{paper_type}' as of {request_date}.
+        Use the `inventory_check_tool` tool to query the database.
+        State the stock status, whether it is sufficient, and if restocking is needed.
+        """
+        return self.run(prompt)
+
 
 class QuoteAgent(ToolCallingAgent):
     def __init__(self, model):
-        """
-        It encapsulates the quote_generation_tool and search_quote_history and specializes in queries related to quotes
-        """
         super().__init__(
             tools=[quote_generation_tool],
             model=model,
-            system_prompt=(
-                                "You are Munder Difflin's Quote Specialist. "
-                "Your role is to evaluate customer quote requests, find pricing history, apply bulk discounts, and return a detailed quote response.\n\n"
-                
-                "INSTRUCTIONS:\n"
-                "1. Always use the `quote_generation_tool` to calculate base prices, apply tiered discounts, and query historical quotes.\n"
-                "2. Ensure you propagate the exact `as_of_date` received in the user prompt to the tools.\n"
-                "3. Always explain your pricing calculation clearly, outlining:\n"
-                "   - The base unit price and standard total.\n"
-                "   - The percentage discount applied (if any) and the total money saved.\n"
-                "   - The final quoted total.\n"
-                "4. If a product is not stocked in our catalog, clearly state that a quote cannot be generated."
-            )
+            name="quote_agent",
+            description="Generates customer quotes and applies appropriate tiered bulk discounts."
         )
+
+    def generate_quote(self, customer_id: str, paper_type: str, quantity: int, request_date: str) -> str:
+        prompt = f"""
+        You are the Quote Specialist.
+        Generate a quote for customer '{customer_id}' ordering {quantity} units of '{paper_type}' as of {request_date}.
+        Use the `quote_generation_tool` to calculate standard price, discounts, and retrieve history.
+        Summarize the quote details and explain the discount applied.
+        """
+        return self.run(prompt)
+
 
 class FulfillmentAgent(ToolCallingAgent):
     def __init__(self, model):
-        """
-        Subclass of ToolCallingAgent representing the Fulfillment Agent.
-        It uses the fulfill_order_tool and supplier_timeline_tool to process transactions and timelines.
-        """
         super().__init__(
             tools=[fulfill_order_tool, supplier_timeline_tool],
             model=model,
-            system_prompt=(
-                "You are Munder Difflin's Fulfillment Agent. "
-                "Your role is to process customer orders and calculate supplier logistics.\n\n"
-                
-                "INSTRUCTIONS:\n"
-                "1. When an order needs to be completed, call `fulfill_order_tool` with the customer_id, paper_type, quantity, and request date.\n"
-                "2. If the order is successfully fulfilled, check if the tool output includes a `reorder_info` suggestion (which happens when stock drops below the safety minimum).\n"
-                "3. If the order cannot be fulfilled due to a stock shortage, review the tool's returned shortage details and supplier timeline.\n"
-                "4. Always ensure you propagate the exact transaction date to the tools.\n"
-                "5. Report back a clear summary of whether the order was fulfilled, any shortage quantity, and the estimated supplier delivery date."
-            )
+            name="fulfillment_agent",
+            description="Logs sales transactions to customers and handles restocking orders to suppliers."
         )
 
+    def process_fulfillment(self, customer_id: str, paper_type: str, quantity: int, request_date: str) -> str:
+        prompt = f"""
+        You are the Fulfillment Agent.
+        Fulfill the order for customer '{customer_id}' requesting {quantity} units of '{paper_type}' as of {request_date}.
+        Use `fulfill_order_tool` to execute the transaction in the database.
+        If a restock is recommended or if stock is insufficient, make sure you coordinate with `supplier_timeline_tool` to get the timeline.
+        Summarize the transaction ID, purchase status, and delivery date.
+        """
+        return self.run(prompt)
 
-class OrchestratorAgent(CodeAgent):
-    def __init__(self, model, managed_agents):
-        """
-        Subclass of CodeAgent representing the Chief Orchestrator.
-        It manages control flow and delegates tasks to sub-agents.
-        """
+
+class OrchestratorAgent(ToolCallingAgent):
+    """Orchestrator that coordinates the Munder Difflin paper order workflow."""
+    
+    def __init__(self, model):
+        self.model = model
+        
+        # 1. Initialize the specialized sub-agents
+        self.inventory_agent = InventoryAgent(model)
+        self.quote_agent = QuoteAgent(model)
+        self.fulfillment_agent = FulfillmentAgent(model)
+
+        # 2. Create coordination routing tools
+        @tool
+        def check_stock_level(paper_type: str, quantity: int, request_date: str) -> str:
+            """Check the database to see if we have enough stock of a paper type.
+            
+            Args:
+                paper_type: The exact name of the paper product
+                quantity: The number of units requested
+                request_date: The date of the request (YYYY-MM-DD)
+                
+            Returns:
+                A text report from the Inventory Agent indicating stock levels and restocking needs
+            """
+            return self.inventory_agent.check_stock(paper_type, quantity, request_date)
+
+        @tool
+        def create_customer_quote(customer_id: str, paper_type: str, quantity: int, request_date: str) -> str:
+            """Generate a pricing quote for a customer order, including bulk discounts.
+            
+            Args:
+                customer_id: The ID of the customer requesting the quote
+                paper_type: The exact name of the paper product
+                quantity: The quantity of paper requested
+                request_date: The date of the request (YYYY-MM-DD)
+                
+            Returns:
+                A quote summary with base price, discounts, and history from the Quote Agent
+            """
+            return self.quote_agent.generate_quote(customer_id, paper_type, quantity, request_date)
+
+        @tool
+        def execute_fulfillment(customer_id: str, paper_type: str, quantity: int, request_date: str) -> str:
+            """Process order fulfillment, log sales transactions, and handle supplier restocking if stock is low.
+            
+            Args:
+                customer_id: The ID of the customer placing the order
+                paper_type: The exact name of the paper product
+                quantity: The quantity of paper requested
+                request_date: The date of the request (YYYY-MM-DD)
+                
+            Returns:
+                A fulfillment report with transaction IDs, totals, and delivery dates from the Fulfillment Agent
+            """
+            return self.fulfillment_agent.process_fulfillment(customer_id, paper_type, quantity, request_date)
+
+        # 3. Call the parent constructor with the coordination tools
         super().__init__(
-            tools=[],
+            tools=[check_stock_level, create_customer_quote, execute_fulfillment],
             model=model,
-            managed_agents=managed_agents,
-            system_prompt=(
-                "You are Munder Difflin's Chief Orchestrator Agent. "
-                "Your goal is to handle customer requests by delegating tasks to your specialized team:\n"
-                "- Use `inventory_agent` to check stock availability.\n"
-                "- Use `quote_agent` to generate quotes with bulk discounts.\n"
-                "- Use `fulfillment_agent` to log sales and process supplier restocking orders.\n\n"
-                
-                "CRITICAL LOGIC FLOW:\n"
-                "1. When a customer request is received, identify the paper type, quantity, and requested date.\n"
-                "2. First, ask `inventory_agent` to check stock as of the requested date.\n"
-                "3. If stock is available:\n"
-                "   a. Ask `quote_agent` to calculate the quote for the request.\n"
-                "   b. Ask `fulfillment_agent` to record the sale transaction. If the transaction triggers a restock suggestion (needs_reorder), tell `fulfillment_agent` to place the restock order immediately.\n"
-                "4. If stock is insufficient:\n"
-                "   a. Do not log a customer sale. Instead, ask `fulfillment_agent` to place an emergency restock order to the supplier.\n"
-                "   b. Inform the customer of the stockout, the shortage quantity, and the estimated supplier delivery date.\n"
-                "5. Always pass the exact request date to all agents so queries and logs are chronologically accurate.\n"
-                "6. Provide a concise final response summarizing the outcome (e.g. sale success, price, restock orders, and timelines)."
-            )
+            name="orchestrator",
+            description="Coordinates specialized agents for inventory, quotes, and fulfillment.",
         )
+        
+    def process_request(self, customer_request: str) -> str:
+        """
+        Process a customer request through the coordinated agent workflow.
+        """
+        prompt = f"""
+        You are the Chief Orchestrator. 
+        A customer has sent a request: "{customer_request}".
+        
+        Your objective is to coordinate the workflow to handle this request using your available tools.
+        
+        CRITICAL workflow rules:
+        1. Extract the paper product name, quantity, customer ID, and request date from the request details.
+        2. Call `check_stock_level` first to check stock availability as of the requested date.
+        3. If stock is sufficient:
+           - Call `create_customer_quote` to get the pricing.
+           - Call `execute_fulfillment` to log the sales transaction.
+        4. If stock is insufficient:
+           - Call `execute_fulfillment` to execute an emergency supplier restocking order.
+           - Summarize the stockout, shortage, and delivery date for the customer.
+        5. Provide a final, comprehensive response to the customer summarizing all transaction details.
+        """
+        return self.run(prompt)
 
 
 
@@ -948,7 +1018,7 @@ class OrchestratorAgent(CodeAgent):
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -975,29 +1045,14 @@ def run_test_scenarios():
     ############
 
     inventory_sub = InventoryAgent(model=model)
-    inventory_managed = ManagedAgent(
-        agent=inventory_sub,
-        name="inventory_agent",
-        description="Checks item stock level, safety minimums, and flags if restocks are needed."
-    )
 
     quote_sub = QuoteAgent(model=model)
-    quote_managed = ManagedAgent(
-        agent=quote_sub,
-        name="quote_agent",
-        description="Generates customer quotes and applies appropriate tiered bulk discounts."
-    )
 
     fulfillment_sub = FulfillmentAgent(model=model)
-    fulfillment_managed = ManagedAgent(
-        agent=fulfillment_sub,
-        name="fulfillment_agent",
-        description="Logs sales transactions to customers and handles restocking orders to suppliers."
-    )
 
     orchestrator_agent = OrchestratorAgent(
         model=model,
-        managed_agents=[inventory_managed, quote_managed, fulfillment_managed]
+        managed_agents=[inventory_sub, quote_sub, fulfillment_sub]
     )
 
     results = []
