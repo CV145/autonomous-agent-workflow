@@ -1,3 +1,4 @@
+
 import pandas as pd
 import numpy as np
 import os
@@ -665,6 +666,14 @@ def inventory_check_tool(paper_type: str, quantity: int, as_of_date: str) -> dic
         ),
     }
 
+@tool
+def inventory_snapshot_tool(as_of_date: str) -> dict:
+    """Return all current inventory quantities as of a date.
+    
+    Args:
+        as_of_date: The date cutoff in YYYY-MM-DD format.
+    """
+    return get_all_inventory(as_of_date)
 
 # Tools for quoting agent
 @tool
@@ -720,7 +729,7 @@ def quote_generation_tool(customer_id: str, paper_type: str, quantity: int, as_o
     }
 
 
-# Tools for ordering agent
+# Tools for ordering/fulfillment agent
 @tool
 def supplier_timeline_tool(paper_type: str, quantity_needed: int, as_of_date: str) -> dict:
     """Estimate when a supplier can deliver additional stock for a paper type.
@@ -739,6 +748,21 @@ def supplier_timeline_tool(paper_type: str, quantity_needed: int, as_of_date: st
     }
 
 
+def customer_safe_fulfillment_message(result: dict) -> str:
+    """Formats a customer-safe message without leaking internal database IDs or financial metrics."""
+    item = result.get("item_name", "your requested item")
+    qty = result.get("requested_quantity", "the requested quantity")
+    if result.get("fulfilled"):
+        price = result.get("sale_price")
+        return f"Your order for {qty} units of {item} was fulfilled. Total: ${price:.2f}."
+    timeline = result.get("restock_info", {}).get("supplier_timeline", {})
+    delivery = timeline.get("estimated_delivery_date", "the next available delivery date")
+    return (
+        f"We cannot fulfill {qty} units of {item} immediately due to limited stock. "
+        f"We are arranging replenishment and expect availability by {delivery}."
+    )
+
+
 @tool
 def fulfill_order_tool(customer_id: str, paper_type: str, quantity: int, as_of_date: str) -> dict:
     """Fulfill a customer order if stock is available, execute sales transaction, and automatically place restocking orders with the supplier when inventory is low or insufficient.
@@ -747,7 +771,7 @@ def fulfill_order_tool(customer_id: str, paper_type: str, quantity: int, as_of_d
         paper_type: The exact name of the paper product to be purchased.
         quantity: The number of units the customer wants to buy.
         as_of_date: The date the order is executed in YYYY-MM-DD format.
-        """
+    """
     # 1. Fetch current stock and catalog details
     inventory_result = inventory_check_tool(paper_type, quantity, as_of_date)
 
@@ -797,15 +821,31 @@ def fulfill_order_tool(customer_id: str, paper_type: str, quantity: int, as_of_d
         else:
             restock_info["reason"] = f"Insufficient cash to restock. Need: ${restock_cost:.2f}, Have: ${cash:.2f}"
 
-        return {
+        # 1. Log full sensitive data internally for audits
+        internal_result = {
             "customer_id": customer_id,
             "item_name": paper_type,
             "requested_quantity": quantity,
             "fulfilled": False,
             "shortage": shortage,
             "restock_info": restock_info,
-            "message": "Insufficient stock to fulfill order immediately. A supplier order has been placed/attempted.",
         }
+        print(f"\n[INTERNAL LOG] Fulfill Order Result: {internal_result}\n")
+
+        # 2. Return ONLY safe data to the agent
+        safe_restock_info = {}
+        if restock_info.get("restock_executed"):
+            safe_restock_info["supplier_timeline"] = restock_info.get("supplier_timeline", {})
+
+        safe_result = {
+            "customer_id": customer_id,
+            "item_name": paper_type,
+            "requested_quantity": quantity,
+            "fulfilled": False,
+            "restock_info": safe_restock_info,
+        }
+        safe_result["message"] = customer_safe_fulfillment_message(safe_result)
+        return safe_result
 
     # ==========================================
     # SCENARIO B: Successful Sale (Fulfill -> Proactive Restock if needed)
@@ -853,7 +893,8 @@ def fulfill_order_tool(customer_id: str, paper_type: str, quantity: int, as_of_d
                 "reason": f"Insufficient cash to restock safety levels. Need: ${reorder_cost:.2f}, Have: ${cash:.2f}"
             }
 
-    return {
+    # 1. Log full sensitive data internally for audits
+    internal_result = {
         "customer_id": customer_id,
         "item_name": paper_type,
         "requested_quantity": quantity,
@@ -861,18 +902,38 @@ def fulfill_order_tool(customer_id: str, paper_type: str, quantity: int, as_of_d
         "transaction_id": sale_tx,
         "sale_price": quote_result["final_total"],
         "reorder_info": reorder_info,
-        "message": f"Order fulfilled successfully for {quantity} units of {paper_type}.",
     }
+    print(f"\n[INTERNAL LOG] Fulfill Order Result: {internal_result}\n")
 
+    # 2. Return ONLY safe data to the agent
+    safe_result = {
+        "customer_id": customer_id,
+        "item_name": paper_type,
+        "requested_quantity": quantity,
+        "fulfilled": True,
+        "sale_price": quote_result["final_total"],
+    }
+    safe_result["message"] = customer_safe_fulfillment_message(safe_result)
+    return safe_result
+
+
+@tool
+def financial_report_tool(as_of_date: str) -> dict:
+    """Generate an internal financial report as of a date.
+    
+    Args:
+        as_of_date: The date cutoff in YYYY-MM-DD format.
+    """
+    return generate_financial_report(as_of_date)
 
 # Set up your agents and create an orchestration agent that will manage them.
 class InventoryAgent(ToolCallingAgent):
     def __init__(self, model):
         super().__init__(
-            tools=[inventory_check_tool],
+            tools=[inventory_check_tool, inventory_snapshot_tool],
             model=model,
             name="inventory_agent",
-            description="Checks item stock level, safety minimums, and flags if restocks are needed."
+            description="Checks item stock level, safety minimums, and warehouse-wide inventory snapshots"
         )
 
     def check_stock(self, paper_type: str, quantity: int, request_date: str) -> str:
@@ -882,6 +943,10 @@ class InventoryAgent(ToolCallingAgent):
         Use the `inventory_check_tool` tool to query the database.
         State the stock status, whether it is sufficient, and if restocking is needed.
         """
+        return self.run(prompt)
+
+    def get_inventory_snapshot(self, request_date: str) -> str:
+        prompt = f"Provide a complete snapshot of all available warehouse stock as of {request_date} using the inventory_snapshot_tool."
         return self.run(prompt)
 
 
@@ -907,20 +972,25 @@ class QuoteAgent(ToolCallingAgent):
 class FulfillmentAgent(ToolCallingAgent):
     def __init__(self, model):
         super().__init__(
-            tools=[fulfill_order_tool, supplier_timeline_tool],
+            tools=[fulfill_order_tool, supplier_timeline_tool, financial_report_tool],
             model=model,
             name="fulfillment_agent",
             description="Logs sales transactions to customers and handles restocking orders to suppliers."
         )
 
     def process_fulfillment(self, customer_id: str, paper_type: str, quantity: int, request_date: str) -> str:
-        prompt = f"""
-        You are the Fulfillment Agent.
-        Fulfill the order for customer '{customer_id}' requesting {quantity} units of '{paper_type}' as of {request_date}.
-        Use `fulfill_order_tool` to execute the transaction in the database.
-        If a restock is recommended or if stock is insufficient, make sure you coordinate with `supplier_timeline_tool` to get the timeline.
-        Summarize the transaction ID, purchase status, and delivery date.
-        """
+            prompt = f"""
+            You are the Fulfillment Agent.
+            Fulfill the order for customer '{customer_id}' requesting {quantity} units of '{paper_type}' as of {request_date}.
+            Use `fulfill_order_tool` to execute the transaction in the database.
+            If a restock is recommended or if stock is insufficient, make sure you coordinate with `supplier_timeline_tool` to get the timeline.
+            Summarize the fulfillment status and delivery date using the safe message provided by the tool. Do not expose internal cash balances, transaction IDs, or restocking costs.
+            """
+            return self.run(prompt)
+
+
+    def get_financial_report(self, request_date: str) -> str:
+        prompt = f"Generate the company's financial report as of {request_date} using the financial_report_tool."
         return self.run(prompt)
 
 
@@ -949,6 +1019,15 @@ class OrchestratorAgent(ToolCallingAgent):
                 A text report from the Inventory Agent indicating stock levels and restocking needs
             """
             return self.inventory_agent.check_stock(paper_type, quantity, request_date)
+
+        @tool
+        def check_warehouse_inventory(request_date: str) -> str:
+            """Check the complete list of all available items and their stock quantities in the warehouse.
+            
+            Args:
+                request_date: The date of the request (YYYY-MM-DD)
+            """
+            return self.inventory_agent.get_inventory_snapshot(request_date)
 
         @tool
         def create_customer_quote(customer_id: str, paper_type: str, quantity: int, request_date: str) -> str:
@@ -980,38 +1059,47 @@ class OrchestratorAgent(ToolCallingAgent):
             """
             return self.fulfillment_agent.process_fulfillment(customer_id, paper_type, quantity, request_date)
 
-        # 3. Call the parent constructor with the coordination tools
+        @tool
+        def check_financial_status(request_date: str) -> str:
+            """Generate the complete financial health status report for the company (assets, cash, inventory value).
+            
+            Args:
+                request_date: The date of the report (YYYY-MM-DD)
+            """
+            return self.fulfillment_agent.get_financial_report(request_date)
+
+        # Call the parent constructor with the coordination tools
         super().__init__(
-            tools=[check_stock_level, create_customer_quote, execute_fulfillment],
+            tools=[check_stock_level, create_customer_quote, execute_fulfillment, check_warehouse_inventory, check_financial_status],
             model=model,
             name="orchestrator",
             description="Coordinates specialized agents for inventory, quotes, and fulfillment.",
         )
+
+    def process_request(self, customer_request: str) -> str:
+        """
+        Process a customer request through the coordinated agent workflow.
+        """
+        prompt = f"""
+        You are the Chief Orchestrator. 
+        A customer has sent a request: "{customer_request}".
         
-        def process_request(self, customer_request: str) -> str:
-            """
-            Process a customer request through the coordinated agent workflow.
-            """
-            prompt = f"""
-            You are the Chief Orchestrator. 
-            A customer has sent a request: "{customer_request}".
-            
-            Your objective is to coordinate the workflow to handle this request using your available tools.
-            
-            CRITICAL workflow rules:
-            1. Extract the paper product name, quantity, customer ID, and request date from the request details.
-            2. Call `check_stock_level` first to check stock availability as of the requested date.
-            3. If stock is sufficient:
-            - Call `create_customer_quote` to get the pricing.
-            - Call `execute_fulfillment` to log the sales transaction.
-            - Once `execute_fulfillment` is run, immediately return your final answer summarizing the successful sale. Do not loop.
-            4. If stock is insufficient:
-            - Call `execute_fulfillment` EXACTLY ONCE to execute the emergency supplier restocking order.
-            - Immediately after calling `execute_fulfillment`, use the `final_answer` tool to inform the customer of the stockout, shortage, and delivery date.
-            - DO NOT check stock again or call any other tool after placing the restock order, as the new stock will only arrive in the future.
-            5. Provide a final, comprehensive response to the customer summarizing all transaction details.
-            """
-            return self.run(prompt)
+        Your objective is to coordinate the workflow to handle this request using your available tools.
+        
+        CRITICAL workflow rules:
+        1. Extract the paper product name, quantity, customer ID, and request date from the request details.
+        2. Call `check_stock_level` first to check stock availability as of the requested date.
+        3. If stock is sufficient:
+           - Call `create_customer_quote` to get the pricing.
+           - Call `execute_fulfillment` to log the sales transaction.
+           - Once `execute_fulfillment` is run, immediately return your final answer summarizing the successful sale. Do not loop.
+        4. If stock is insufficient:
+           - Call `execute_fulfillment` EXACTLY ONCE to execute the emergency supplier restocking order.
+           - Immediately after calling `execute_fulfillment`, use the `final_answer` tool to inform the customer of the stockout, shortage, and delivery date.
+           - DO NOT check stock again or call any other tool after placing the restock order, as the new stock will only arrive in the future.
+        5. Provide a final response to the customer using the safe customer message from the fulfillment tool. Never expose internal cash balances, restocking costs, or transaction IDs to the customer.
+        """
+        return self.run(prompt)
 
 
 
@@ -1075,7 +1163,7 @@ def run_test_scenarios():
         ############
         ############
 
-        response = orchestrator_agent.run(request_with_date)
+        response = orchestrator_agent.process_request(request_with_date)
 
         # Update state
         report = generate_financial_report(request_date)

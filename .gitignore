@@ -16,5 +16,3 @@ __pycache__/
 *.db
 munder_difflin.db
 
-# Output files from test runs
-test_results.csv
