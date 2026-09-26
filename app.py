@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from project_starter import (
+from orchestrator import (
     db_engine,
     init_database,
     generate_financial_report,
