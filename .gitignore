@@ -16,3 +16,4 @@ __pycache__/
 *.db
 munder_difflin.db
 
+.DS_Store

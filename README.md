@@ -4,6 +4,13 @@ An event-driven multi-agent architecture built in Python to automate end-to-end 
 
 ![System Architecture](architecture-diagram.png)
 
+## Repository Structure & Modular Design
+
+- `app.py`: Streamlit interactive dashboard providing a real-time UI to submit quote requests, inspect dynamic pricing, and monitor agent execution states.
+- `orchestrator.py`: Core multi-agent execution engine managing state, prompt routing, tool calling, and transactional guardrails.
+- `quotes.csv` & `quote_requests.csv`: Relational and historical datasets powering dynamic discount modeling and test evaluation batches.
+- `evaluation_report.md`: Detailed performance metrics, error analyses, and edge-case benchmarking.
+
 ## Architecture Overview
 
 The system orchestrates a team of specialized autonomous agents that coordinate state, execute tools, and validate transactional boundaries:
@@ -36,5 +43,12 @@ cd autonomous-agent-workflow
 pip install -r requirements.txt
 ```
 
-### 2. Run
+### 2. Run the interactive streamlit app
 streamlit run app.py
+
+### 3. Run batch orchestration
+python orchestrator.py
+
+
+### Note
+An OPEN AI API Key in a .env file is needed to make the AI calls
