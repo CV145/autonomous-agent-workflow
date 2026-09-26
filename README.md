@@ -2,7 +2,7 @@
 
 An event-driven multi-agent architecture built in Python to automate end-to-end sales operations, dynamic pricing, and inventory reconciliation from unstructured customer requests.
 
-![System Architecture](architecture.png)
+![System Architecture](architecture-diagram.png)
 
 ## Architecture Overview
 
